@@ -19,6 +19,8 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset
+from typing import List, Dict, Any
+from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
 
 accelerate = Accelerator()
@@ -26,7 +28,8 @@ accelerate = Accelerator()
 encoder_path = '/project/lt200203-aimedi/pud/gen-x-report/model/rad-dino-12c'
 deocder_path = '/project/lt200203-aimedi/pud/gen-x-report/model/RadLLaMA-7b'
 
-model = Blip2ForConditionalGeneration.from_pretrained("/project/lt200203-aimedi/pud/gen-x-report/model/blip2-opt-2.7b",ignore_mismatched_sizes=True)
+model = Blip2ForConditionalGeneration.from_pretrained("/project/lt200203-aimedi/pud/gen-x-report/model/blip2-opt-2.7b",
+                                                    ignore_mismatched_sizes=True)
 
 processor = AutoImageProcessor.from_pretrained(encoder_path)
 encoder = AutoModel.from_pretrained(encoder_path,
@@ -57,6 +60,20 @@ model.config.pad_token_id = tokenizer.pad_token_id
 
 model.language_model.resize_token_embeddings(len(tokenizer))
 
+params = model.state_dict()
+embeddings = params['language_model.model.embed_tokens.weight']
+pre_expansion_embeddings = embeddings[:-65,:]
+mu = torch.mean(pre_expansion_embeddings, dim=0)
+n = pre_expansion_embeddings.size()[0]
+sigma = ((pre_expansion_embeddings - mu).T @ (pre_expansion_embeddings - mu)) / n
+dist = torch.distributions.multivariate_normal.MultivariateNormal(
+        mu, covariance_matrix=1e-5*sigma)
+
+new_embeddings = torch.stack(tuple((dist.sample() for _ in range(65))), dim=0)
+embeddings[-65:,:] = new_embeddings
+params['language_model.model.embed_tokens.weight'][-65:,:] = new_embeddings
+model.load_state_dict(params)
+
 class ChestXrayDataset(Dataset):
     def __init__(self, dataframe, tokenizer, processor, max_length=512):
         self.df = dataframe
@@ -76,130 +93,95 @@ class ChestXrayDataset(Dataset):
             print(f"Error opening image: {path}, {e}")
             return None
 
+    def _process_image(self, image):
+        if image is None:
+            return None
+        return self.processor(images=image, return_tensors="pt", do_rescale=False)['pixel_values'].squeeze(0)
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        # Load images
-        view1 = self._safe_open_image(row.get('view1'))
-        view2 = self._safe_open_image(row.get('view2'))
-        view3 = self._safe_open_image(row.get('view3'))
+        
+        processed_views = []
+        for i in range(1, 4):
+            view = self._safe_open_image(row.get(f'view{i}'))
+            if view is not None:
+                processed_view = self._process_image(view)
+                if processed_view is not None:
+                    processed_views.append(processed_view)
 
-        # Process images
-        view1_img_processed = (
-            self.processor(images=view1, return_tensors="pt", do_rescale=False)['pixel_values']
-            if view1 else torch.zeros((3, 518, 518))
-        )
-        view2_img_processed = (
-            self.processor(images=view2, return_tensors="pt", do_rescale=False)['pixel_values']
-            if view2 else torch.zeros((3, 518, 518))
-        )
-        view3_img_processed = (
-            self.processor(images=view3, return_tensors="pt", do_rescale=False)['pixel_values']
-            if view3 else torch.zeros((3, 518, 518))
-        )
+        if not processed_views:
+            print(f"Skipping index {idx} due to no valid images.")
+            return self.__getitem__((idx + 1) % len(self.df))
 
-        combined_img = torch.cat([
-            view1_img_processed.squeeze(0) if view1 else torch.zeros(3, 518, 518),
-            view2_img_processed.squeeze(0) if view2 else torch.zeros(3, 518, 518),
-            view3_img_processed.squeeze(0) if view3 else torch.zeros(3, 518, 518),
-        ], dim=0)
-
-        # Encode text
         text = f"{row['findings']} [SEP] {row['impression']}"
         encodings = self.tokenizer(text)
         encodings.input_ids.append(self.tokenizer.eos_token_id)
         encodings.attention_mask.append(1)
 
         return {
-            'combined_img': combined_img,
-            'input_ids': torch.tensor(encodings['input_ids']).squeeze(0),
-            'attention_mask': torch.tensor(encodings['attention_mask']).squeeze(0),
-            'labels': torch.tensor(encodings['input_ids']).squeeze(0)
+            'pixel_values': processed_views,
+            'input_ids': encodings['input_ids'],
+            'attention_mask': encodings['attention_mask'],
+            'labels': encodings['input_ids'].copy()
         }
 
-#import warnings
-#warnings.filterwarnings(
-#    "ignore",
-#    message="You are using `torch.load` with `weights_only=False`",
-#    category=FutureWarning,
-#)
-#
-#class PreprocessedDataset(Dataset):
-#    
-#    def __init__(self, save_dir, num_to_load=None):
-#        
-#        print(f"Initializing dataset from {save_dir}...")
-#        self.file_paths = sorted(
-#            [os.path.join(save_dir, f) for f in os.listdir(save_dir) if f.endswith('.pt')]
-#        )
-#        if num_to_load is not None:
-#            self.file_paths = self.file_paths[:num_to_load]
-#        self.data = []
-#
-#    def __len__(self):
-#        
-#        return len(self.file_paths)
-#
-#    def __getitem__(self, idx):
-#        
-#        file_path = self.file_paths[idx]
-#        try:
-#            item = torch.load(file_path, map_location='cpu')
-#            return item
-#        except Exception as e:
-#            print(f"Skipping corrupted file: {file_path}, Error: {e}")
-#            #raise IndexError(f"Item at index {idx} could not be loaded.")
-
-
-#def data_collator(batch):
-#    input_ids = torch.stack([item.get('input_ids', torch.zeros(518, dtype=torch.long)) for item in batch]).to(device)
-#    attention_mask = torch.stack([item.get('attention_mask', torch.zeros(518, dtype=torch.long)) for item in batch]).to(device)
-#    labels = torch.stack(item[labels]) for item in batch]).to(device)
-#    pixel_values = torch.stack([item["pixel_values"] for item in batch]).to(device)
-
-def data_collator(batch):
-    inputs = tokenizer.pad(
-        [{"input_ids": item["input_ids"], 
-        "attention_mask": item["attention_mask"]} for item in batch],
-        padding=True,
-        return_tensors="pt"
-    )
-    pixel_values = torch.stack([item["combined_img"] for item in batch])
+@dataclass
+class DataCollatorForMultipleViews:
+    tokenizer: Any
     
-    return {
-        'pixel_values': pixel_values,
-        'input_ids': inputs["input_ids"],
-        'attention_mask': inputs["attention_mask"],
-        'labels': inputs["input_ids"],
-    }
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        
+        pixel_values_list = [item.pop('pixel_values') for item in features]
+        batch_text = self.tokenizer.pad(
+            [{'input_ids': f['input_ids'], 
+                'attention_mask': f['attention_mask']} for f in features],
+            padding=True,
+            return_tensors="pt"
+        )
+        
+        labels = self.tokenizer.pad(
+            [{'input_ids': f['labels']} for f in features],
+            padding=True,
+            return_tensors="pt"
+        )
+        
+        max_views = max(len(views) for views in pixel_values_list)
+        
+        processed_views = []
+        for view_idx in range(max_views):
+            view_tensors = []
+            for item_views in pixel_values_list:
+                if view_idx < len(item_views):
+                    view_tensors.append(item_views[view_idx])
+                else:
+                    first_valid_shape = next(tensor.shape for views in pixel_values_list for tensor in views)
+                    view_tensors.append(
+                        torch.zeros(
+                            first_valid_shape,
+                            dtype=next(iter(item_views)).dtype,
+                            device=next(iter(item_views)).device
+                        )
+                    )
+            processed_views.append(torch.stack(view_tensors))
+        
+        return {
+            'pixel_values': processed_views,
+            'input_ids': batch_text['input_ids'],
+            'attention_mask': batch_text['attention_mask'],
+            'labels': labels['input_ids']
+        }
 
-df = pd.read_csv('/project/lt200203-aimedi/pud/gen-x-report/mimic-run/fine-tuning-1/cleaned-2000-case.csv')
+data_collator = DataCollatorForMultipleViews(tokenizer=tokenizer)
+df = pd.read_csv('/project/lt200203-aimedi/pud/gen-x-report/mimic-run/fine-tuning-1/IU_MIMIC_Pad-GR.csv')
 train_df, eval_df = train_test_split(df, test_size=0.2, random_state=42)
 train_dataset = ChestXrayDataset(train_df, tokenizer, processor)
 eval_dataset = ChestXrayDataset(eval_df, tokenizer, processor)
-
-#train_dataset = PreprocessedDataset(
-#    save_dir="/scratch/lt200203-aimedi/mimic-cxr-tencor/train",
-#    num_to_load=None
-#    )
-#eval_dataset = PreprocessedDataset(
-#    save_dir="/scratch/lt200203-aimedi/mimic-cxr-tencor/eval",
-#    num_to_load=None
-#    )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def train_model():
     for param in model.parameters():
         param.requires_grad = False
-        
-    for param in model.vision_model.embeddings.parameters():
-        param.requires_grad = True
-        
-    #for param in model.vision_model.linear_proj.parameters():
-    #    param.requires_grad = True
-    #    
-    #for param in model.vision_model.layernorm.parameters():
-    #    param.requires_grad = True
         
     for param in model.qformer.parameters():
         param.requires_grad = True
@@ -213,26 +195,29 @@ def train_model():
     for layer in model.language_model.model.layers:
         for param in layer.self_attn.parameters():
             param.requires_grad = True
+        
+    for param in model.language_model.lm_head.parameters():
+        param.requires_grad = True
     #for k,v in dataset[0].items():
     #    print(f"{k} {v.shape} {v.dtype} {v.min()} {v.max()}")
     print("train:", len(train_dataset))
     print("eval:", len(eval_dataset))
     
     training_args = Seq2SeqTrainingArguments(
-        output_dir='/scratch/lt200203-aimedi/gen-x-report/raddino-qformer-radllama-p3-t0.01-test-v4/checkpoints',
+        output_dir='/scratch/lt200203-aimedi/save-v6/raddino-qformer-radllama-p3-t0.01-v6/checkpoints',
         per_device_eval_batch_size=16,
         per_device_train_batch_size=16,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
-        logging_steps=6,#<--------
-        num_train_epochs=5,#<--------
+        logging_steps=128,#<--------
+        num_train_epochs=10,#<--------
         save_steps=1,#<--------
         eval_steps=1,#<--------
         evaluation_strategy="epoch", 
         save_strategy="epoch",
         save_total_limit=10,
-        logging_dir='/scratch/lt200203-aimedi/gen-x-report/raddino-qformer-radllama-p3-t0.01-test-v4/log',
-        warmup_steps=1,#<--------
+        logging_dir='/scratch/lt200203-aimedi/save-v6/raddino-qformer-radllama-p3-t0.01-v6/log',
+        warmup_steps=7,#<--------
         warmup_ratio=1e-3,
         lr_scheduler_type='cosine',
         optim='adamw_torch',
@@ -241,11 +226,11 @@ def train_model():
         remove_unused_columns=False,
         gradient_checkpointing=True,
         ddp_find_unused_parameters=True,
-        disable_tqdm=True,
+        disable_tqdm=False,
         dataloader_num_workers=8,
         load_best_model_at_end=True,
         dataloader_pin_memory=False,
-        predict_with_generate=True,
+        #predict_with_generate=True,
         #torch_compile=True,
         deepspeed= '/project/lt200203-aimedi/pud/gen-x-report/Encoder-Decoder/deepspeed_config.json'
     )
@@ -260,6 +245,7 @@ def train_model():
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3,early_stopping_threshold=0.01)]
     ))
     trainer.train()
-    trainer.save_model("/scratch/lt200203-aimedi/gen-x-report/model-raddino-qformer-radllama-p3-t0.01-test-v4")
+    trainer.save_model("/project/lt200203-aimedi/pud/gen-x-report/Encoder-Decoder/model-raddino-qformer-radllama-p3-t0.01-v6")
+    trainer.save_model("/scratch/lt200203-aimedi/model-raddino-qformer-radllama-p3-t0.01-v6")
     
 train_model()

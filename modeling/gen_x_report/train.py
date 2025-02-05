@@ -5,6 +5,7 @@ from transformers import (
     EarlyStoppingCallback, 
     Seq2SeqTrainingArguments,
     AutoTokenizer,
+    TrainerCallback
                             )
 import torch
 import pandas as pd
@@ -173,6 +174,35 @@ class DataCollatorForMultipleViews:
             'labels': labels
         }
 
+class TemperatureSchedulerCallback(TrainerCallback):
+    def __init__(
+        self, 
+        model, 
+        initial_temp=0.07, 
+        decay_rate=0.1, 
+        min_temp=0.01
+    ):
+        self.model = model
+        self.initial_temp = initial_temp
+        self.decay_rate = decay_rate
+        self.min_temp = min_temp
+    
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        # Calculate new temperature based on current epoch
+        current_epoch = state.epoch
+        new_temp = self.initial_temp / (1 + self.decay_rate * current_epoch)
+        new_temp = max(new_temp, self.min_temp)
+        
+        # Update model's temperature parameter
+        if hasattr(self.model, 'temperature'):
+            self.model.temperature.data = torch.tensor(
+                new_temp, 
+                device=self.model.temperature.device
+            )
+        
+        # Optional: Log the temperature
+        print(f"Epoch {current_epoch}: Temperature set to {new_temp}")
+
 data_collator = DataCollatorForMultipleViews(tokenizer=tokenizer)
 df = pd.read_csv('/project/lt200203-aimedi/pud/gen-x-report/preparedata_iuxray.csv')
 #df = df.sample(n=2000, random_state=42)
@@ -210,19 +240,19 @@ def train_model():
     print("eval:", len(eval_dataset))
     
     training_args = Seq2SeqTrainingArguments(
-        output_dir='/project/lt200203-aimedi/pud/gen-x-report/modeling/train/v2/checkpoints',
-        per_device_eval_batch_size=20,
-        per_device_train_batch_size=20,
+        output_dir='/project/lt200203-aimedi/pud/gen-x-report/modeling/train/v4/checkpoints',
+        per_device_eval_batch_size=16,
+        per_device_train_batch_size=16,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
         logging_steps=24,#<--------
-        num_train_epochs=5,#<--------
+        num_train_epochs=10,#<--------
         save_steps=1,#<--------
         eval_steps=1,#<--------
         evaluation_strategy="epoch", 
         save_strategy="epoch",
         save_total_limit=10,
-        logging_dir='/project/lt200203-aimedi/pud/gen-x-report/modeling/train/v2/log',
+        logging_dir='/project/lt200203-aimedi/pud/gen-x-report/modeling/train/v4/log',
         warmup_steps=5,#<--------
         warmup_ratio=1e-3,
         lr_scheduler_type='cosine',
@@ -231,6 +261,7 @@ def train_model():
         bf16=True,
         remove_unused_columns=False,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={'use_reentrant':False},
         ddp_find_unused_parameters=True,
         disable_tqdm=False,
         dataloader_num_workers=8,
@@ -248,9 +279,9 @@ def train_model():
         tokenizer=tokenizer,
         data_collator=data_collator,
         #compute_metrics=compute_metrics,
-        #callbacks=[EarlyStoppingCallback(early_stopping_patience=2,early_stopping_threshold=0.01)]
+        callbacks=[TemperatureSchedulerCallback(model)]
     )
     trainer.train()
-    trainer.save_model("/project/lt200203-aimedi/pud/gen-x-report/modeling/train/v2/model")
+    trainer.save_model("/project/lt200203-aimedi/pud/gen-x-report/modeling/train/v4/model")
 
 train_model()

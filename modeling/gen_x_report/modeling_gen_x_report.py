@@ -40,6 +40,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 import collections.abc
 
@@ -2340,6 +2341,11 @@ def info_nce_loss(image_embeds, text_embeds, temperature=0.07):
         torch.Tensor: Scalar contrastive loss.
     """
     # Normalize embeddings to unit vectors
+    if torch.allclose(image_embeds, torch.zeros_like(image_embeds)):
+        print("Warning: Zero image embeddings detected")
+    if torch.allclose(text_embeds, torch.zeros_like(text_embeds)):
+        print("Warning: Zero text embeddings detected")
+    
     image_embeds = F.normalize(image_embeds, dim=-1)
     text_embeds = F.normalize(text_embeds, dim=-1)
     
@@ -2352,6 +2358,10 @@ def info_nce_loss(image_embeds, text_embeds, temperature=0.07):
     # Labels are the diagonal indices (positive pairs)
     batch_size = image_embeds.shape[0]
     labels = torch.arange(batch_size, device=image_embeds.device)  # [0, 1, ..., batch_size-1]
+    
+    if torch.isnan(similarity_matrix).any():
+        print("NaN in similarity matrix")
+        return torch.tensor(0.0, device=similarity_matrix.device, requires_grad=True)
     
     # Compute cross-entropy loss (equivalent to -log(exp(s_pos) / sum(exp(s_neg))))
     loss = F.cross_entropy(similarity_matrix, labels)
@@ -2466,7 +2476,7 @@ class GenXReportModel(GenXReportPreTrainedModel):
         self.language_projection = nn.Linear(config.qformer_config.hidden_size, config.text_config.hidden_size)
         self.language_model = GXRLanguageModel(config.text_config)
 
-        self.gradnorm = GradNormLoss(alpha=1.5)
+        self.temperature = nn.Parameter(torch.tensor(0.07))
 
         self.post_init()
 
@@ -2552,9 +2562,9 @@ class GenXReportModel(GenXReportPreTrainedModel):
             encoder_attention_mask=image_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
         )
-        query_output = query_outputs[0]
+        query_output = query_outputs.last_hidden_state
 
         # step 3: use the language model, conditioned on the query outputs and the prompt
         language_model_inputs = self.language_projection(query_output)
@@ -2578,22 +2588,47 @@ class GenXReportModel(GenXReportPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        
         logits = outputs.logits if return_dict else outputs[0]
         loss = None
         # we compute the loss here since we need to take into account the sequence length of the query embeds
         if labels is not None:
             labels = labels.to(logits.device)
+            #-----------------CrossEntropyLoss------------------------
             logits = logits[:, -labels.size(1) :, :]
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous().to(logits.device)
             # Flatten the tokens
             loss_fct = CrossEntropyLoss(reduction="mean")
-            loss = loss_fct(shift_logits.view(-1, self.config.text_config.vocab_size), shift_labels.view(-1))
+            loss_crossentropy = loss_fct(shift_logits.view(-1, self.config.text_config.vocab_size), shift_labels.view(-1))
 
-        if not return_dict:
-            output = (logits, vision_outputs, query_outputs, outputs)
-            return ((loss,) + output) if loss is not None else output
+            #-----------------Contrastive Loss------------------------
+            text_embed_output = self.language_model(input_ids=labels, output_hidden_states=True)
+            #text_embed = self.text_pooling_contrastive(text_embed_output.hidden_states[-1])
+            text_hidden_states = text_embed_output.hidden_states[-1]
+            text_embed = torch.mean(text_hidden_states, dim=1)
+
+            image_embed = language_model_inputs[:, 0, :]
+
+            loss_contrastive = info_nce_loss(image_embed, text_embed, temperature=self.temperature.item())
+            
+            #if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"Loss (CrossEntropy): {loss_crossentropy.item()}", end=" | ")
+            print(f"Loss (Contrastive): {loss_contrastive.item()}", end=" | ")
+            print(f"Temperature: {self.temperature.item()}")
+
+            ##-----------------total Loss------------------------
+            loss = loss_crossentropy + loss_contrastive
+            ## Get shared parameters for GradNorm (e.g. vision and qformer params)
+            #shared_params = [p for p in list(self.vision_model.parameters()) + 
+            #    list(self.qformer.parameters()) if p.requires_grad]
+            ## Compute combined loss using GradNorm
+            #total_loss, gradnorm_loss = self.gradnorm.compute_grad_norm_loss(loss_contrastive, loss_crossentropy, shared_params)
+            ## Update GradNorm weights
+            #self.gradnorm.update_weights()
+            ## Optional: add gradnorm loss to total loss with small weight
+            #loss = total_loss + 0.1 * gradnorm_loss
 
         return Blip2ForConditionalGenerationModelOutput(
             loss=loss,
